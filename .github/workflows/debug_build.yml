@@ -10,6 +10,19 @@ on:
   pull_request:
     branches:
       - master
+workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+      build_type:
+        description: 'Build configuration (debug|release)'
+        required: false
+        default: 'debug'
+      version:
+        description: 'Optional version string'
+        required: false
     paths-ignore:
       - '**.md'
       - 'img/**'
