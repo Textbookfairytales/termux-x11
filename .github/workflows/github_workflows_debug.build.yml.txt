@@ -1,0 +1,44 @@
+# Example debug.build workflow with workflow_dispatch added.
+# Add or merge the `workflow_dispatch` section under `on:` in your existing workflow file.
+name: debug.build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+      build_type:
+        description: 'Build configuration (debug|release)'
+        required: false
+        default: 'debug'
+      version:
+        description: 'Optional version string'
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show inputs
+        run: |
+          echo "Ref: ${{ github.ref }}"
+          echo "Triggered by: ${{ github.actor }}"
+          echo "Environment: ${{ github.event.inputs.environment }}"
+          echo "Build type: ${{ github.event.inputs.build_type }}"
+          echo "Version: ${{ github.event.inputs.version }}"
+
+      # Add your existing build steps here
+      - name: Example build step
+        run: |
+          echo "Run your debug.build commands here"
