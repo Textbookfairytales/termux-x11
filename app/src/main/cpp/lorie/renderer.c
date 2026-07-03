@@ -10,13 +10,17 @@
 #define EGL_EGLEXT_PROTOTYPES
 #define GL_GLEXT_PROTOTYPES
 
+#define CVT_H_GRANULARITY 8
+
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
 #include <android/native_window_jni.h>
 #include <android/log.h>
+#include <media/NdkImageReader.h>
 #include <dlfcn.h>
+#include <math.h>
 #include <sys/mman.h>
 #include "list.h"
 #include "lorie.h"
@@ -114,11 +118,19 @@ static EGLSurface defaultSfc = EGL_NO_SURFACE, sfc = EGL_NO_SURFACE;
 static EGLConfig cfg = 0;
 static ANativeWindow *defaultWin = NULL, *win = NULL;
 static volatile struct xorg_list addedBuffers, buffers, removedBuffers;
+volatile jint filtering = GL_NEAREST;
 
-static JNIEnv* renderEnv = NULL;
 static volatile bool stateChanged = false, windowChanged = false;
 static volatile struct lorie_shared_server_state* pendingState = NULL;
 static volatile ANativeWindow* pendingWin = NULL;
+static volatile int viewportX = 0, viewportY = 0, viewportW = 0, viewportH = 0, expectedW = 0, expectedH = 0;
+static volatile int zoomPercent = 100;
+static float zoomSourceLeft = 0.f, zoomSourceTop = 0.f;
+static JNIEnv* rendererEnv = NULL;
+static jclass lorieViewClass = NULL;
+static jmethodID setRendererViewportMethod = NULL;
+static int reportedViewportX = -1, reportedViewportY = -1, reportedViewportW = -1, reportedViewportH = -1;
+static float reportedSourceLeft = -1.f, reportedSourceTop = -1.f, reportedSourceWidth = -1.f, reportedSourceHeight = -1.f;
 
 static pthread_mutex_t stateLock;
 static pthread_cond_t stateCond;
@@ -139,12 +151,39 @@ static void pthreadCondVarProxyInit(void);
 static void* pthreadCondVarProxyThread(void* cookie);
 static void pthreadCondVarProxyListenOtherCondVar(pthread_cond_t* var);
 
-static inline __always_inline void bindLinearTexture(GLuint id) {
+static inline __always_inline void bindTexture(GLuint id) {
     glBindTexture(GL_TEXTURE_2D, id);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filtering);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filtering);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+}
+
+static void reportRendererViewport(int dstX, int dstY, int dstW, int dstH, float left, float top, float width, float height) {
+    JNIEnv* env = rendererEnv;
+    if (!env || !lorieViewClass || !setRendererViewportMethod)
+        return;
+
+    if (reportedViewportX == dstX && reportedViewportY == dstY &&
+        reportedViewportW == dstW && reportedViewportH == dstH &&
+        reportedSourceLeft == left && reportedSourceTop == top &&
+        reportedSourceWidth == width && reportedSourceHeight == height)
+        return;
+
+    (*env)->CallStaticVoidMethod(env, lorieViewClass, setRendererViewportMethod, dstX, dstY, dstW, dstH, left, top, width, height);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionDescribe(env);
+        (*env)->ExceptionClear(env);
+    } else {
+        reportedViewportX = dstX;
+        reportedViewportY = dstY;
+        reportedViewportW = dstW;
+        reportedViewportH = dstH;
+        reportedSourceLeft = left;
+        reportedSourceTop = top;
+        reportedSourceWidth = width;
+        reportedSourceHeight = height;
+    }
 }
 
 static EGLint configAttribs[] = {
@@ -161,19 +200,29 @@ const EGLint ctxattribs[] = {
         EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE
 };
 
-int rendererInitThread(JavaVM *vm) {
-    JNIEnv* env;
+static void onImageAvailable(void* context, AImageReader* reader) {
+    AImage* image = NULL;
+    if (AImageReader_acquireLatestImage(reader, &image) == AMEDIA_OK && image)
+        AImage_delete(image);
+}
+
+int rendererInitThread(void* cookie) {
+    JavaVM* vm = cookie;
+    if ((*vm)->AttachCurrentThread(vm, &rendererEnv, NULL) != JNI_OK) {
+        log("Failed to attach renderer thread to JVM");
+        return 0;
+    }
+
     EGLint major, minor;
     EGLint numConfigs;
     EGLint *const alphaAttrib = &configAttribs[11];
+    AImageReader* reader = NULL; // We will use this ImageReader each time surface is destroyed, zero reasons to clean it up
 
     pthread_setname_np(pthread_self(), "LorieRendererThread");
 
     xorg_list_init(&addedBuffers);
     xorg_list_init(&buffers);
     xorg_list_init(&removedBuffers);
-
-    (*vm)->AttachCurrentThread(vm, &env, NULL);
 
     egl_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
     if (egl_display == EGL_NO_DISPLAY)
@@ -197,20 +246,24 @@ int rendererInitThread(JavaVM *vm) {
     // Weird devices without proper EGL_KHR_surfaceless_context support
     // We can not use pbuffer-based surfaces because it will require searching for configs supporting it
     // and I am not sure all devices have configs supporting both pbuffers and regular surfaces simultaneously
-    jclass surfaceTextureClass = (*env)->FindClass(env, "android/graphics/SurfaceTexture");
-    jclass surfaceClass = (*env)->FindClass(env, "android/view/Surface");
+    if (AImageReader_new(1, 1, AIMAGE_FORMAT_RGBA_8888, 2, &reader) != AMEDIA_OK) {
+        log("Failed to initialise ImageReader");
+        return 1;
+    }
 
-    jmethodID surfaceTextureConstructor = (*env)->GetMethodID(env, surfaceTextureClass, "<init>", "(Z)V");
-    jmethodID surfaceConstructor = (*env)->GetMethodID(env, surfaceClass, "<init>", "(Landroid/graphics/SurfaceTexture;)V");
+    if (AImageReader_setImageListener(reader, &(AImageReader_ImageListener) { .context = NULL, .onImageAvailable = onImageAvailable }) != AMEDIA_OK) {
+        log("Failed to set ImageReader listener");
+        AImageReader_delete(reader);
+        return 1;
+    }
 
-    jobject surfaceTextureObject = (*env)->NewObject(env, surfaceTextureClass, surfaceTextureConstructor, true);
-    jobject surfaceObject = (*env)->NewObject(env, surfaceClass, surfaceConstructor, surfaceTextureObject);
+    if (AImageReader_getWindow(reader, &defaultWin) != AMEDIA_OK) {
+        log("Failed to obtain ImageReader native window");
+        AImageReader_delete(reader);
+        return 1;
+    }
 
-    // We will use this surfacetexture each time surface is destroyed, zero reasons to clean it up
-    (*env)->NewGlobalRef(env, surfaceTextureObject);
-    (*env)->NewGlobalRef(env, surfaceObject);
-
-    win = defaultWin = ANativeWindow_fromSurface(env, surfaceObject);
+    win = defaultWin;
     ANativeWindow_acquire(defaultWin);
 
     sfc = defaultSfc = eglCreateWindowSurface(egl_display, cfg, win, NULL);
@@ -241,12 +294,15 @@ int rendererInitThread(JavaVM *vm) {
 
 void rendererInit(JNIEnv* env) {
     pthread_t t;
-    JavaVM *vm;
+    JavaVM* vm;
 
     if (ctx)
         return;
 
     (*env)->GetJavaVM(env, &vm);
+    jclass clazz = (*env)->FindClass(env, "com/termux/x11/LorieView");
+    lorieViewClass = (*env)->NewGlobalRef(env, clazz);
+    setRendererViewportMethod = (*env)->GetStaticMethodID(env, lorieViewClass, "setRendererViewport", "(IIIIFFFF)V");
 
     pthreadCondVarProxyInit();
 
@@ -257,13 +313,17 @@ void rendererInit(JNIEnv* env) {
 
     pthread_create(&t, NULL, (void*(*)(void*)) rendererInitThread, vm);
 }
+void rendererSetFiltering(JNIEnv* env, jobject self, jint f) {
+    filtering = f;
+}
 
-void rendererTestCapabilities(int* legacy_drawing, uint8_t* flip) {
+void rendererTestCapabilities(int* legacy_drawing) {
     // Some devices do not support sampling from HAL_PIXEL_FORMAT_BGRA_8888, here we are checking it.
     const EGLint imageAttributes[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
     EGLint numConfigs;
     EGLClientBuffer clientBuffer;
     EGLImageKHR img;
+    EGLint major, minor;
     AHardwareBuffer *new = NULL;
     int status;
     AHardwareBuffer_Desc d0 = {
@@ -271,7 +331,7 @@ void rendererTestCapabilities(int* legacy_drawing, uint8_t* flip) {
             .height = 64,
             .layers = 1,
             .usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN,
-            .format = AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM
+            .format = AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM
     };
 
     if (egl_display == EGL_NO_DISPLAY) {
@@ -279,6 +339,12 @@ void rendererTestCapabilities(int* legacy_drawing, uint8_t* flip) {
         if (egl_display == EGL_NO_DISPLAY)
             return vprintEglError("Got no EGL display", __LINE__);
     }
+
+    if (eglInitialize(egl_display, &major, &minor) != EGL_TRUE)
+        return vprintEglError("Unable to initialize EGL", __LINE__);
+
+    loge("Xlorie: Initialized EGL version %d.%d\n", major, minor);
+    eglBindAPI(EGL_OPENGL_ES_API);
 
     status = AHardwareBuffer_allocate(&d0, &new);
     if (status != 0 || new == NULL) {
@@ -308,14 +374,9 @@ void rendererTestCapabilities(int* legacy_drawing, uint8_t* flip) {
     }
 
     if (!(img = eglCreateImageKHR(egl_display, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, clientBuffer, imageAttributes))) {
-        if (eglGetError() == EGL_BAD_PARAMETER) {
-            loge("Sampling from HAL_PIXEL_FORMAT_BGRA_8888 is not supported, forcing AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM");
-            *flip = 1;
-        } else {
-            loge("Failed to obtain EGLImageKHR from EGLClientBuffer");
-            loge("Forcing legacy drawing");
-            *legacy_drawing = 1;
-        }
+        loge("Failed to obtain EGLImageKHR from EGLClientBuffer");
+        loge("Forcing legacy drawing");
+        *legacy_drawing = 1;
         AHardwareBuffer_release(new);
     } else {
         // For some reason all devices I checked had no GL_EXT_texture_format_BGRA8888 support, but some of them still provided BGRA extension.
@@ -346,17 +407,14 @@ void rendererTestCapabilities(int* legacy_drawing, uint8_t* flip) {
 
         glActiveTexture(GL_TEXTURE0); checkGlError();
         glGenTextures(1, &texture); checkGlError();
-        bindLinearTexture(texture);
+        bindTexture(texture);
         glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, img); checkGlError();
         glGenFramebuffers(1, &fbo); checkGlError();
         glBindFramebuffer(GL_FRAMEBUFFER, fbo); checkGlError();
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0); checkGlError();
         uint32_t pixel[64*64];
         glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, &pixel); checkGlError();
-        if (pixel[0] == 0xAABBCCDD) {
-            log("Xlorie: GLES draws pixels unchanged, probably system does not support AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM. Forcing bgra.\n");
-            *flip = 1;
-        } else if (pixel[0] != 0xAADDCCBB) {
+        if (pixel[0] != 0xAABBCCDD && pixel[0] != 0xFFBBCCDD) {
             log("Xlorie: GLES receives broken pixels. Forcing legacy drawing. 0x%X\n", pixel[0]);
             *legacy_drawing = 1;
         }
@@ -420,7 +478,11 @@ void rendererRemoveAllBuffers(void) {
     pthread_spin_unlock(&bufferLock);
 }
 
-void rendererSetWindow(ANativeWindow* newWin) {
+void rendererSetWindow(JNIEnv *env, __unused jobject thiz, jobject jsfc) {
+    ANativeWindow* newWin = jsfc ? ANativeWindow_fromSurface(env, jsfc) : NULL;
+    if (newWin)
+        ANativeWindow_acquire(newWin);
+
     pthread_mutex_lock(&stateLock);
     if (newWin && pendingWin == newWin) {
         ANativeWindow_release(newWin);
@@ -432,6 +494,7 @@ void rendererSetWindow(ANativeWindow* newWin) {
         ANativeWindow_release(pendingWin);
 
     pendingWin = newWin;
+    expectedW = expectedH = 0;
     windowChanged = TRUE;
 
     pthread_cond_signal(&stateCond);
@@ -462,6 +525,35 @@ static inline __always_inline void releaseWinAndSurface(ANativeWindow** anw, EGL
         ANativeWindow_release(*anw);
         *anw = defaultWin;
     }
+}
+
+void rendererSetViewport(__unused JNIEnv *env, __unused jclass clazz, int x, int y, int w, int h, int ew, int eh) {
+    pthread_mutex_lock(&stateLock);
+    viewportX = x;
+    viewportY = y;
+    viewportW = w;
+    viewportH = h;
+    expectedW = ew;
+    expectedH = eh;
+    reportedViewportX = reportedViewportY = reportedViewportW = reportedViewportH = -1;
+    reportedSourceLeft = reportedSourceTop = reportedSourceWidth = reportedSourceHeight = -1.f;
+    if (state)
+        state->drawRequested = true;
+    pthread_cond_signal(&stateCond);
+    pthread_mutex_unlock(&stateLock);
+}
+
+void rendererSetZoom(__unused JNIEnv *env, __unused jclass clazz, int percent) {
+    pthread_mutex_lock(&stateLock);
+    zoomPercent = percent < 100 ? 100 : (percent > 400 ? 400 : percent);
+    reportedViewportX = reportedViewportY = reportedViewportW = reportedViewportH = -1;
+    reportedSourceLeft = reportedSourceTop = reportedSourceWidth = reportedSourceHeight = -1.f;
+    if (zoomPercent == 100)
+        zoomSourceLeft = zoomSourceTop = 0.f;
+    if (state)
+        state->drawRequested = true;
+    pthread_cond_signal(&stateCond);
+    pthread_mutex_unlock(&stateLock);
 }
 
 void rendererRefreshContext(void) {
@@ -508,8 +600,8 @@ void rendererRefreshContext(void) {
     log("Xlorie: new surface applied: %p\n", sfc);
 }
 
-static void draw(GLuint id, float x0, float y0, float x1, float y1, float xfactor, uint8_t flip);
-static void drawCursor(float displayWidth, float displayHeight);
+static void drawRegion(GLuint id, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, uint8_t flip);
+static void drawCursor(float displayWidth, float displayHeight, float sourceLeft, float sourceTop);
 
 void rendererRedrawLocked(bool* waitingForBuffers) {
     float xfactor = 1.f;
@@ -531,6 +623,88 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
 
     desc = LorieBuffer_description(buffer);
 
+    int alignedExpectedW = expectedW - (expectedW % CVT_H_GRANULARITY);
+
+    if (!expectedW || !expectedH || desc->height != expectedH ||
+        (desc->width != alignedExpectedW && desc->width != expectedW)) {
+        log("Buffer %llu is not of expected size, expecting %dx%d or %dx%d, got %dx%d",
+            state->rootWindowTextureID, alignedExpectedW, expectedH, expectedW, expectedH,
+            desc->width, desc->height);
+        return;
+    }
+
+    int surfaceH = ANativeWindow_getHeight(win);
+    int surfaceW = ANativeWindow_getWidth(win);
+    int renderViewportX = viewportX, renderViewportY = viewportY, renderViewportW = viewportW, renderViewportH = viewportH;
+    float destinationScaleX = 1.f, destinationScaleY = 1.f;
+    if (zoomPercent > 100 && viewportW > 0 && viewportH > 0) {
+        float requestedScale = (float) zoomPercent / 100.f;
+        float centerX = (float) viewportX + (float) viewportW / 2.f;
+        float centerY = (float) viewportY + (float) viewportH / 2.f;
+        float maxW = 2.f * fminf(centerX, (float) surfaceW - centerX);
+        float maxH = 2.f * fminf(centerY, (float) surfaceH - centerY);
+        destinationScaleX = fminf(requestedScale, maxW / (float) viewportW);
+        destinationScaleY = fminf(requestedScale, maxH / (float) viewportH);
+        if (destinationScaleX < 1.f)
+            destinationScaleX = 1.f;
+        if (destinationScaleY < 1.f)
+            destinationScaleY = 1.f;
+
+        renderViewportW = (int) ((float) viewportW * destinationScaleX + 0.5f);
+        renderViewportH = (int) ((float) viewportH * destinationScaleY + 0.5f);
+        renderViewportX = (int) (centerX - (float) renderViewportW / 2.f + 0.5f);
+        renderViewportY = (int) (centerY - (float) renderViewportH / 2.f + 0.5f);
+    }
+
+    glDisable(GL_SCISSOR_TEST);
+    glViewport(0, 0, surfaceW, surfaceH);
+    glClearColor(0.f, 0.f, 0.f, 1.f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glViewport(renderViewportX, surfaceH - renderViewportY - renderViewportH, renderViewportW, renderViewportH);
+    float sourceLeft = 0.f, sourceTop = 0.f;
+    float sourceWidth = (float) desc->width, sourceHeight = (float) desc->height;
+    float logicalSourceWidth = (float) expectedW, logicalSourceHeight = (float) expectedH;
+    if (zoomPercent > 100) {
+        float requestedScale = (float) zoomPercent / 100.f;
+        sourceWidth = (float) expectedW * destinationScaleX / requestedScale;
+        sourceHeight = (float) expectedH * destinationScaleY / requestedScale;
+        logicalSourceWidth = sourceWidth;
+        logicalSourceHeight = sourceHeight;
+        // Keep the zoomed region stable while the cursor stays inside the central 90%.
+        // Only pan when the cursor enters this 5% edge band near any side.
+        float edgeX = sourceWidth * 0.05f;
+        float edgeY = sourceHeight * 0.05f;
+        float cursorX = (float) state->cursor.x;
+        float cursorY = (float) state->cursor.y;
+
+        if (cursorX < zoomSourceLeft + edgeX)
+            zoomSourceLeft = cursorX - edgeX;
+        else if (cursorX > zoomSourceLeft + sourceWidth - edgeX)
+            zoomSourceLeft = cursorX - sourceWidth + edgeX;
+
+        if (cursorY < zoomSourceTop + edgeY)
+            zoomSourceTop = cursorY - edgeY;
+        else if (cursorY > zoomSourceTop + sourceHeight - edgeY)
+            zoomSourceTop = cursorY - sourceHeight + edgeY;
+
+        if (zoomSourceLeft < 0.f)
+            zoomSourceLeft = 0.f;
+        else if (zoomSourceLeft + sourceWidth > (float) expectedW)
+            zoomSourceLeft = (float) expectedW - sourceWidth;
+
+        if (zoomSourceTop < 0.f)
+            zoomSourceTop = 0.f;
+        else if (zoomSourceTop + sourceHeight > (float) expectedH)
+            zoomSourceTop = (float) expectedH - sourceHeight;
+
+        sourceLeft = zoomSourceLeft;
+        sourceTop = zoomSourceTop;
+    } else
+        zoomSourceLeft = zoomSourceTop = 0.f;
+
+    reportRendererViewport(renderViewportX, renderViewportY, renderViewportW, renderViewportH,
+                           sourceLeft, sourceTop, logicalSourceWidth, logicalSourceHeight);
+
     // We should signal X server to not use root window while we actively copy it
     lorie_mutex_lock(&state->lock, &state->lockingPid);
     state->drawRequested = FALSE;
@@ -538,7 +712,11 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     LorieBuffer_bindTexture(buffer);
     if (desc->type == LORIEBUFFER_FD)
         xfactor = (float) desc->width/(float) desc->stride;
-    draw(0, -1.f, -1.f, 1.f, 1.f, xfactor, LorieBuffer_isRgba(buffer));
+    drawRegion(0, -1.f, -1.f, 1.f, 1.f,
+               sourceLeft / (float) desc->width * xfactor, sourceTop / (float) desc->height,
+               (sourceLeft + sourceWidth) / (float) desc->width * xfactor,
+               (sourceTop + sourceHeight) / (float) desc->height,
+               LorieBuffer_isRgba(buffer));
     fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, NULL);
     glFlush();
 
@@ -546,13 +724,13 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
         log("Xlorie: updating cursor\n");
         lorie_mutex_lock(&state->cursor.lock, &state->cursor.lockingPid);
         state->cursor.updated = false;
-        bindLinearTexture(cursor.id);
+        bindTexture(cursor.id);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, (GLsizei) state->cursor.width, (GLsizei) state->cursor.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, state->cursor.bits);
         lorie_mutex_unlock(&state->cursor.lock, &state->cursor.lockingPid);
     }
 
     state->cursor.moved = FALSE;
-    drawCursor((float) (LorieBuffer_getWidth(buffer)), (float) (LorieBuffer_getHeight(buffer)));
+    drawCursor(sourceWidth, sourceHeight, sourceLeft, sourceTop);
     glFlush();
 
     // Wait until root window drawing is finished before giving control back to X server
@@ -571,7 +749,7 @@ void rendererRedrawLocked(bool* waitingForBuffers) {
     glClear(GL_COLOR_BUFFER_BIT);
     glDisable(GL_SCISSOR_TEST);
     fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, NULL);
-    eglClientWaitSyncKHR(egl_display, fence, 0, EGL_FOREVER);
+    eglClientWaitSyncKHR(egl_display, fence, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, EGL_FOREVER);
     eglDestroySyncKHR(egl_display, fence);
 
     state->renderedFrames++;
@@ -717,12 +895,12 @@ static GLuint createProgram(const char* p_vertex_source, const char* p_fragment_
     return 0;
 }
 
-static void draw(GLuint id, float x0, float y0, float x1, float y1, float xfactor, uint8_t flip) {
+static void drawRegion(GLuint id, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, uint8_t flip) {
     float coords[16] = {
-        x0, -y0, 0.f, 0.f,
-        x1, -y0, xfactor, 0.f,
-        x0, -y1, 0.f, 1.f,
-        x1, -y1, xfactor, 1.f,
+        x0, -y0, u0, v0,
+        x1, -y0, u1, v0,
+        x0, -y1, u0, v1,
+        x1, -y1, u1, v1,
     };
 
     GLuint p = flip ? gv_pos_bgra : gv_pos, c = flip ? gv_coords_bgra : gv_coords;
@@ -732,6 +910,8 @@ static void draw(GLuint id, float x0, float y0, float x1, float y1, float xfacto
     if (id)
         glBindTexture(GL_TEXTURE_2D, id);
 
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filtering);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filtering);
     glVertexAttribPointer(p, 2, GL_FLOAT, GL_FALSE, 16, coords);
     glVertexAttribPointer(c, 2, GL_FLOAT, GL_FALSE, 16, &coords[2]);
     glEnableVertexAttribArray(p);
@@ -739,19 +919,19 @@ static void draw(GLuint id, float x0, float y0, float x1, float y1, float xfacto
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4); checkGlError();
 }
 
-__unused static void drawCursor(float displayWidth, float displayHeight) {
+__unused static void drawCursor(float displayWidth, float displayHeight, float sourceLeft, float sourceTop) {
     float x, y, w, h;
 
     if (!state->cursor.width || !state->cursor.height)
         return;
 
-    x = 2.f * ((float) state->cursor.x - (float) state->cursor.xhot) / displayWidth - 1.f;
-    y = 2.f * ((float) state->cursor.y - (float) state->cursor.yhot) / displayHeight - 1.f;
+    x = 2.f * ((float) state->cursor.x - sourceLeft - (float) state->cursor.xhot) / displayWidth - 1.f;
+    y = 2.f * ((float) state->cursor.y - sourceTop - (float) state->cursor.yhot) / displayHeight - 1.f;
     w = 2.f * (float) state->cursor.width / displayWidth;
     h = 2.f * (float) state->cursor.height / displayHeight;
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    draw(cursor.id, x, y, x + w, y + h, 1.f, false);
+    drawRegion(cursor.id, x, y, x + w, y + h, 0.f, 0.f, 1.f, 1.f, false);
     glDisable(GL_BLEND);
 }
 

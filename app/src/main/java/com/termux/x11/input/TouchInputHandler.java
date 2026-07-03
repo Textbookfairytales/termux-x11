@@ -13,6 +13,7 @@ import android.annotation.SuppressLint;
 import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
+import android.graphics.Matrix;
 import android.graphics.PointF;
 import android.hardware.display.DisplayManager;
 import android.hardware.input.InputManager;
@@ -92,6 +93,8 @@ public class TouchInputHandler {
     private final InputEventSender mInjector;
     private final MainActivity mActivity;
     private final DisplayMetrics mMetrics = new DisplayMetrics();
+    private final float[] mappedPoint = new float[2];
+    private final float[] matrixValues = new float[9];
 
     private final BiConsumer<Integer, Boolean> noAction = (key, down) -> {};
     private BiConsumer<Integer, Boolean> swipeUpAction = noAction, swipeDownAction = noAction,
@@ -101,6 +104,7 @@ public class TouchInputHandler {
     private static final int KEY_BACK = 158;
 
     private boolean keyIntercepting = false;
+    private boolean ignoreGamepadEvents = false;
 
     /**
      * Used for tracking swipe gestures. Only the Y-direction is needed for responding to swipe-up
@@ -262,13 +266,26 @@ public class TouchInputHandler {
     }
 
     boolean isDexEvent(MotionEvent event) {
-        int SOURCE_DEX = InputDevice.SOURCE_MOUSE | InputDevice.SOURCE_TOUCHSCREEN;
+        // Besides Samsung DeX, several external pointing devices (e.g. some
+        // Bluetooth keyboard+touchpad combos, see #1011) report their taps as
+        // SOURCE_MOUSE + TOOL_TYPE_FINGER (but not SOURCE_TOUCHPAD). Match those
+        // too so they go through the touchpad gesture path and tap-to-click /
+        // multi-finger taps work, instead of the hardware-mouse path which only
+        // forwards physical button state. Real mice use TOOL_TYPE_MOUSE and real
+        // touchpads report SOURCE_TOUCHPAD, so neither is affected.
+        int SOURCE_DEX = InputDevice.SOURCE_MOUSE;
         return ((event.getSource() & SOURCE_DEX) == SOURCE_DEX)
                 && ((event.getSource() & InputDevice.SOURCE_TOUCHPAD) != InputDevice.SOURCE_TOUCHPAD)
                 && (event.getToolType(event.getActionIndex()) == MotionEvent.TOOL_TYPE_FINGER);
     }
 
     public boolean handleTouchEvent(View view0, View view, MotionEvent event) {
+        if (ignoreGamepadEvents && (event.isFromSource(InputDevice.SOURCE_GAMEPAD) || event.isFromSource(InputDevice.SOURCE_JOYSTICK)))
+            return true;
+
+        if (event.getDeviceId() >= 0)
+            mInjector.releaseStuckModifiers(event.getMetaState());
+
         // Regular touchpads and Dex touchpad (in captured mode) send events as finger too,
         // but they should be handled as touchscreens with trackpad mode.
         if (mTouchpadHandler != null && ((event.getToolType(event.getActionIndex()) == MotionEvent.TOOL_TYPE_FINGER &&
@@ -357,31 +374,16 @@ public class TouchInputHandler {
         return false;
     }
 
-    private void resetTransformation() {
-        float sx = (float) mRenderData.screenWidth / (float) mRenderData.imageWidth;
-        float sy = (float) mRenderData.screenHeight / (float) mRenderData.imageHeight;
-        mRenderData.scale.set(sx, sy);
-    }
-
-    public void handleClientSizeChanged(int w, int h) {
-        mRenderData.screenWidth = w;
-        mRenderData.screenHeight = h;
-
-        if (mTouchpadHandler != null)
-            mTouchpadHandler.handleClientSizeChanged(w, h);
-
-        resetTransformation();
-    }
-
-    public void handleHostSizeChanged(int w, int h) {
-        mRenderData.imageWidth = w;
-        mRenderData.imageHeight = h;
-
-        if (mTouchpadHandler != null)
-            mTouchpadHandler.handleHostSizeChanged(w, h);
-
-        resetTransformation();
+    public void handleInputTransformChanged(int screenWidth, int screenHeight, Matrix inputTransform) {
+        inputTransform.getValues(matrixValues);
+        mRenderData.scale.set(matrixValues[Matrix.MSCALE_X], matrixValues[Matrix.MSCALE_Y]);
+        mRenderData.screenWidth = screenWidth;
+        mRenderData.screenHeight = screenHeight;
+        mRenderData.setInputTransform(inputTransform);
         MainActivity.getRealMetrics(mMetrics);
+
+        if (mTouchpadHandler != null)
+            mTouchpadHandler.handleInputTransformChanged(screenWidth, screenHeight, inputTransform);
     }
 
     public void setInputMode(@InputMode int inputMode) {
@@ -466,6 +468,8 @@ public class TouchInputHandler {
         backButtonAction = extractUserActionFromPreferences(p, "backButton");
         mediaKeysAction = extractUserActionFromPreferences(p, "mediaKeys");
 
+        ignoreGamepadEvents = p.ignoreGamepadEvents.get();
+
         if(mTouchpadHandler != null)
             mTouchpadHandler.reloadPreferences(p);
     }
@@ -523,7 +527,7 @@ public class TouchInputHandler {
             return null;
 
         String key = pref.asList().get().replace(' ', '_');
-        int id = mActivity.getResources().getIdentifier("notification_" + key, "string", mActivity.getPackageName());
+        int id = mActivity.getResources().getIdentifier("lorie_notification_" + key, "string", mActivity.getPackageName());
         return id == 0 ? null : mActivity.getResources().getString(id);
     }
 
@@ -561,9 +565,9 @@ public class TouchInputHandler {
     /** Moves the cursor to the specified position on the screen. */
     private void moveCursorToScreenPoint(float screenX, float screenY) {
         if (mInputStrategy instanceof InputStrategyInterface.TrackpadInputStrategy || mInputStrategy instanceof InputStrategyInterface.SimulatedTouchInputStrategy) {
-            float[] imagePoint = {screenX * mRenderData.scale.x, screenY * mRenderData.scale.y};
-            if (mRenderData.setCursorPosition(imagePoint[0], imagePoint[1]))
-                mInjector.sendCursorMove((int) imagePoint[0], imagePoint[1], false);
+            mRenderData.mapScreenPoint(screenX, screenY, mappedPoint);
+            if (mRenderData.setCursorPosition(mappedPoint[0], mappedPoint[1]))
+                mInjector.sendCursorMove((int) mappedPoint[0], (int) mappedPoint[1], false);
         }
     }
 
@@ -748,12 +752,10 @@ public class TouchInputHandler {
 
         /** Determines whether the given screen point lies outside the desktop image. */
         private boolean screenPointLiesOutsideImageBoundary(float screenX, float screenY) {
-            float scaledX = screenX * mRenderData.scale.x, scaledY = screenY * mRenderData.scale.y;
+            mRenderData.mapScreenPoint(screenX, screenY, mappedPoint);
 
-            float imageWidth = (float) mRenderData.imageWidth + EPSILON;
-            float imageHeight = (float) mRenderData.imageHeight + EPSILON;
-
-            return scaledX < -EPSILON || scaledX > imageWidth || scaledY < -EPSILON || scaledY > imageHeight;
+            return mappedPoint[0] < -EPSILON || mappedPoint[0] > mRenderData.screenWidth + EPSILON ||
+                    mappedPoint[1] < -EPSILON || mappedPoint[1] > mRenderData.screenHeight + EPSILON;
         }
     }
 
@@ -780,6 +782,9 @@ public class TouchInputHandler {
     }
 
     public boolean sendKeyEvent(KeyEvent e) {
+        if (ignoreGamepadEvents && (e.isFromSource(InputDevice.SOURCE_GAMEPAD) || e.isFromSource(InputDevice.SOURCE_JOYSTICK)))
+            return true;
+
         int k = e.getKeyCode();
 
         if (!MainActivity.isConnected()) {
@@ -788,6 +793,9 @@ public class TouchInputHandler {
 
             return false;
         }
+
+        if (e.getDeviceId() >= 0)
+            mInjector.releaseStuckModifiers(e.getMetaState());
 
         if (isMediaSessionKey(k)) {
             if (mediaKeysAction == noAction)
@@ -861,9 +869,9 @@ public class TouchInputHandler {
             }
 
             if (!v.hasPointerCapture()) {
-                float scaledX = e.getX() * mRenderData.scale.x, scaledY = e.getY() * mRenderData.scale.y;
-                if (mRenderData.setCursorPosition(scaledX, scaledY))
-                    mInjector.sendCursorMove(scaledX, scaledY, false);
+                mRenderData.mapScreenPoint(e.getX(), e.getY(), mappedPoint);
+                if (mRenderData.setCursorPosition(mappedPoint[0], mappedPoint[1]))
+                    mInjector.sendCursorMove(mappedPoint[0], mappedPoint[1], false);
             } else if (e.getAction() == MotionEvent.ACTION_MOVE && e.getPointerCount() == 1) {
                 boolean axis_relative_x = e.getDevice().getMotionRange(MotionEvent.AXIS_RELATIVE_X) != null;
                 boolean mouse_relative = (e.getSource() & InputDevice.SOURCE_MOUSE_RELATIVE) == InputDevice.SOURCE_MOUSE_RELATIVE;
@@ -953,12 +961,12 @@ public class TouchInputHandler {
 
             if (MainActivity.getInstance().getLorieView().hasPointerCapture() &&
                     isExternal(dev) && rangeX != null && rangeY != null) {
-                newX *= mRenderData.imageWidth / rangeX.getMax();
-                newY *= mRenderData.imageHeight / rangeY.getMax();
-            } else {
-                newX *= mRenderData.scale.x;
-                newY *= mRenderData.scale.y;
+                newX *= (float) mMetrics.widthPixels / rangeX.getMax();
+                newY *= (float) mMetrics.heightPixels / rangeY.getMax();
             }
+            mRenderData.mapScreenPoint(newX, newY, mappedPoint);
+            newX = mappedPoint[0];
+            newY = mappedPoint[1];
 
             if (x == newX && y == newY && pressure == e.getPressure() && tilt == e.getAxisValue(MotionEvent.AXIS_TILT) &&
                     orientation == e.getAxisValue(MotionEvent.AXIS_ORIENTATION) && buttons == newButtons)
@@ -1050,9 +1058,9 @@ public class TouchInputHandler {
                     checkButtons(e);
                     return true;
                 case MotionEvent.ACTION_HOVER_MOVE: {
-                    float scaledX = e.getX() * mRenderData.scale.x, scaledY = e.getY() * mRenderData.scale.y;
-                    if (mRenderData.setCursorPosition(scaledX, scaledY))
-                        mInjector.sendCursorMove(scaledX, scaledY, false);
+                    mRenderData.mapScreenPoint(e.getX(), e.getY(), mappedPoint);
+                    if (mRenderData.setCursorPosition(mappedPoint[0], mappedPoint[1]))
+                        mInjector.sendCursorMove(mappedPoint[0], mappedPoint[1], false);
                     return true;
                 }
                 case MotionEvent.ACTION_DOWN:
@@ -1087,9 +1095,9 @@ public class TouchInputHandler {
                     if (mIsScrolling && isScrollingEvent(e))
                         mScroller.onTouchEvent(e);
                     else if ((mIsDragging && hasFlags(e, 0x4000000)) || onTap) {
-                        float scaledX = e.getX() * mRenderData.scale.x, scaledY = e.getY() * mRenderData.scale.y;
-                        if (mRenderData.setCursorPosition(scaledX, scaledY))
-                            mInjector.sendCursorMove(scaledX, scaledY, false);
+                        mRenderData.mapScreenPoint(e.getX(), e.getY(), mappedPoint);
+                        if (mRenderData.setCursorPosition(mappedPoint[0], mappedPoint[1]))
+                            mInjector.sendCursorMove(mappedPoint[0], mappedPoint[1], false);
                     }
                     return true;
                 case MotionEvent.ACTION_HOVER_EXIT: // when the user removes their hand from the trackpad, all states should be reset

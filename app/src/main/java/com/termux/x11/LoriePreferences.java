@@ -191,8 +191,8 @@ public class LoriePreferences extends AppCompatActivity implements PreferenceFra
         private static final Method onSetInitialValue;
         static {
             try {
-                //noinspection JavaReflectionMemberAccess
-                onSetInitialValue = Preference.class.getMethod("onSetInitialValue", boolean.class, Object.class);
+                onSetInitialValue = Preference.class.getDeclaredMethod("onSetInitialValue", boolean.class, Object.class);
+                onSetInitialValue.setAccessible(true);
             } catch (NoSuchMethodException e) {
                 throw new RuntimeException(e);
             }
@@ -233,7 +233,7 @@ public class LoriePreferences extends AppCompatActivity implements PreferenceFra
         @SuppressLint("DiscouragedApi")
         int findId(String name) {
             //noinspection DataFlowIssue
-            return getResources().getIdentifier("pref_" + name, "string", getContext().getPackageName());
+            return getResources().getIdentifier("lorie_pref_" + name, "string", getContext().getPackageName());
         }
 
         /** @noinspection DataFlowIssue*/
@@ -272,10 +272,10 @@ public class LoriePreferences extends AppCompatActivity implements PreferenceFra
             with("showAdditionalKbd", p -> p.setLayoutResource(R.layout.preference));
             with("version", p -> p.setSummary(BuildConfig.VERSION_NAME));
 
-            setSummary("displayStretch", R.string.pref_summary_requiresExactOrCustom);
-            setSummary("adjustResolution", R.string.pref_summary_requiresExactOrCustom);
-            setSummary("pauseKeyInterceptingWithEsc", R.string.pref_summary_requiresIntercepting);
-            setSummary("scaleTouchpad", R.string.pref_summary_requiresTrackpadAndNative);
+            setSummary("displayStretch", R.string.lorie_pref_summary_requiresExactOrCustom);
+            setSummary("adjustResolution", R.string.lorie_pref_summary_requiresExactOrCustom);
+            setSummary("pauseKeyInterceptingWithEsc", R.string.lorie_pref_summary_requiresIntercepting);
+            setSummary("scaleTouchpad", R.string.lorie_pref_summary_requiresTrackpadAndNative);
 
             if (!SamsungDexUtils.available())
                 setVisible("dexMetaKeyCapture", false);
@@ -419,8 +419,10 @@ public class LoriePreferences extends AppCompatActivity implements PreferenceFra
                 String value = (String) newValue;
                 try {
                     String[] resolution = value.split("x");
-                    Integer.parseInt(resolution[0]);
-                    Integer.parseInt(resolution[1]);
+                    int width = Integer.parseInt(resolution[0]);
+                    int height = Integer.parseInt(resolution[1]);
+                    if (width <= 0 || height <= 0)
+                        throw new NumberFormatException();
                 } catch (NumberFormatException | PatternSyntaxException ignored) {
                     Toast.makeText(getActivity(), "Wrong resolution format", Toast.LENGTH_SHORT).show();
                     return false;
@@ -542,8 +544,10 @@ public class LoriePreferences extends AppCompatActivity implements PreferenceFra
                             case "displayResolutionCustom": {
                                 try {
                                     String[] resolution = newValue.split("x");
-                                    Integer.parseInt(resolution[0]);
-                                    Integer.parseInt(resolution[1]);
+                                    int width = Integer.parseInt(resolution[0]);
+                                    int height = Integer.parseInt(resolution[1]);
+                                    if (width <= 0 || height <= 0)
+                                        throw new NumberFormatException();
                                 } catch (NumberFormatException | PatternSyntaxException ignored) {
                                     sendResponse(remote, 1, 1, "displayResolutionCustom: Wrong resolution format.");
                                     return;

@@ -8,10 +8,12 @@ import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.ContextWrapper;
 import android.graphics.Color;
+import android.graphics.Matrix;
 import android.graphics.Point;
 import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.drawable.ColorDrawable;
+import android.opengl.GLES20;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.CancellationSignal;
@@ -24,6 +26,7 @@ import android.text.Selection;
 import android.util.AttributeSet;
 import android.util.Log;
 import android.view.KeyEvent;
+import android.view.Display;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
@@ -50,6 +53,7 @@ import androidx.core.math.MathUtils;
 
 import com.termux.x11.input.InputStub;
 import com.termux.x11.input.TouchInputHandler;
+import com.termux.x11.utils.SamsungDexUtils;
 
 import java.util.Set;
 import java.util.concurrent.Executor;
@@ -330,8 +334,10 @@ class InputConnectionWrapper implements InputConnection {
 @Keep @SuppressLint("WrongConstant")
 @SuppressWarnings("deprecation")
 public class LorieView extends SurfaceView implements InputStub {
+    private static int rendererZoom = 100;
+
     public interface Callback {
-        void changed(int surfaceWidth, int surfaceHeight, int screenWidth, int screenHeight);
+        void inputTransformChanged(int screenWidth, int screenHeight, Matrix inputTransform);
     }
 
     interface PixelFormat {
@@ -345,6 +351,12 @@ public class LorieView extends SurfaceView implements InputStub {
     private final InputMethodManager mIMM = (InputMethodManager)getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
     private Callback mCallback;
     private final Point p = new Point();
+    private final Rect contentInsets = new Rect();
+    private final Rect viewport = new Rect();
+    private final Rect inputViewport = new Rect();
+    private final Matrix inputTransform = new Matrix();
+    private float inputSourceLeft = 0.f, inputSourceTop = 0.f;
+    private float inputSourceWidth = 0.f, inputSourceHeight = 0.f;
     boolean commitedText = false;
     private final InputConnection mConnection = new InputConnectionWrapper(new BaseInputConnection(this, false) {
         private final MainActivity a = MainActivity.getInstance();
@@ -563,18 +575,11 @@ public class LorieView extends SurfaceView implements InputStub {
             height = getMeasuredHeight();
 
             Log.d("SurfaceChangedListener", "Surface was changed: " + width + "x" + height);
-            if (mCallback == null)
-                return;
-
-            getDimensionsFromSettings();
-            if (mCallback != null)
-                mCallback.changed(width, height, p.x, p.y);
+            updateViewport();
         }
 
         @Override public void surfaceDestroyed(@NonNull SurfaceHolder holder) {
             LorieView.this.surfaceChanged(null);
-            if (mCallback != null)
-                mCallback.changed(0, 0, 0, 0);
         }
     };
 
@@ -588,17 +593,9 @@ public class LorieView extends SurfaceView implements InputStub {
         getHolder().addCallback(mSurfaceCallback);
         clipboard = (ClipboardManager) getContext().getSystemService(Context.CLIPBOARD_SERVICE);
         nativeInit();
-    }
 
-    public void setCallback(Callback callback) {
-        mCallback = callback;
-        triggerCallback();
-    }
-
-    public void triggerCallback() {
         setFocusable(true);
         setFocusableInTouchMode(true);
-        requestFocus();
 
         setBackground(new ColorDrawable(Color.TRANSPARENT) {
             public boolean isStateful() {
@@ -608,15 +605,20 @@ public class LorieView extends SurfaceView implements InputStub {
                 return true;
             }
         });
-
-        Rect r = getHolder().getSurfaceFrame();
-        MainActivity.getInstance().runOnUiThread(() -> mSurfaceCallback.surfaceChanged(getHolder(), PixelFormat.BGRA_8888, r.width(), r.height()));
     }
 
-    void getDimensionsFromSettings() {
+    public void setCallback(Callback callback) {
+        mCallback = callback;
+        triggerCallback();
+    }
+
+    public void triggerCallback() {
+        requestFocus();
+        updateViewport();
+    }
+
+    void getDimensionsFromSettings(int width, int height) {
         Prefs prefs = MainActivity.getPrefs();
-        int width = getMeasuredWidth();
-        int height = getMeasuredHeight();
         int w = width;
         int h = height;
         switch(prefs.displayResolutionMode.get()) {
@@ -637,6 +639,8 @@ public class LorieView extends SurfaceView implements InputStub {
                     String[] resolution = prefs.displayResolutionCustom.get().split("x");
                     w = Integer.parseInt(resolution[0]);
                     h = Integer.parseInt(resolution[1]);
+                    if (w <= 0 || h <= 0)
+                        throw new NumberFormatException();
                 } catch (NumberFormatException | PatternSyntaxException ignored) {
                     w = 1280;
                     h = 1024;
@@ -651,37 +655,103 @@ public class LorieView extends SurfaceView implements InputStub {
             p.set(w, h);
     }
 
+    private Matrix getInputTransform() {
+        inputTransform.reset();
+        inputTransform.postTranslate(-inputViewport.left, -inputViewport.top);
+        inputTransform.postScale(inputSourceWidth / (float) inputViewport.width(), inputSourceHeight / (float) inputViewport.height());
+        inputTransform.postTranslate(inputSourceLeft, inputSourceTop);
+        return new Matrix(inputTransform);
+    }
+
+    private void updateInputTransform() {
+        if (mCallback != null)
+            mCallback.inputTransformChanged(p.x, p.y, getInputTransform());
+    }
+
+    private void sendWindowChange() {
+        String name;
+        int framerate = (int) (getDisplay() != null ? getDisplay().getRefreshRate() : 30);
+
+        if (getDisplay() == null || getDisplay().getDisplayId() == Display.DEFAULT_DISPLAY)
+            name = "builtin";
+        else if (SamsungDexUtils.checkDeXEnabled(MainActivity.getInstance()))
+            name = "dex";
+        else
+            name = "external";
+
+        sendWindowChange(p.x, p.y, framerate, name);
+    }
+
+    @Keep
+    @SuppressWarnings("unused")
+    private static void setRendererViewport(int viewportLeft, int viewportTop, int viewportWidth, int viewportHeight,
+                                            float sourceLeft, float sourceTop, float sourceWidth, float sourceHeight) {
+        MainActivity.handler.post(() -> {
+            MainActivity activity = MainActivity.getInstance();
+            if (activity == null)
+                return;
+
+            LorieView view = activity.getLorieView();
+            view.inputViewport.set(viewportLeft, viewportTop, viewportLeft + viewportWidth, viewportTop + viewportHeight);
+            view.inputSourceLeft = sourceLeft;
+            view.inputSourceTop = sourceTop;
+            view.inputSourceWidth = sourceWidth;
+            view.inputSourceHeight = sourceHeight;
+            view.updateInputTransform();
+        });
+    }
+
+    public void setContentInsets(int left, int top, int right, int bottom) {
+        if (contentInsets.left == left && contentInsets.top == top && contentInsets.right == right && contentInsets.bottom == bottom)
+            return;
+
+        contentInsets.set(left, top, right, bottom);
+        updateViewport();
+    }
+
+    private void updateViewport() {
+        Prefs prefs = MainActivity.getPrefs();
+
+        int surfaceW = getMeasuredWidth(), surfaceH = getMeasuredHeight();
+        int availableLeft = contentInsets.left, availableTop = contentInsets.top;
+        int availableW = Math.max(0, surfaceW - contentInsets.left - contentInsets.right);
+        int availableH = Math.max(0, surfaceH - contentInsets.top - contentInsets.bottom);
+
+        if (availableW == 0 || availableH == 0)
+            return;
+
+        getDimensionsFromSettings(availableW, availableH);
+
+        int drawW = availableW;
+        int drawH = availableH;
+
+        if (!prefs.displayStretch.get()) {
+            if (drawW > drawH * p.x / p.y)
+                drawW = drawH * p.x / p.y;
+            else
+                drawH = drawW * p.y / p.x;
+        }
+
+        int left = availableLeft + (availableW - drawW) / 2;
+        int top = availableTop + (availableH - drawH) / 2;
+
+        viewport.set(left, top, left + drawW, top + drawH);
+        if (rendererZoom == 100 || inputSourceWidth == 0.f || inputSourceHeight == 0.f) {
+            inputViewport.set(viewport);
+            inputSourceLeft = inputSourceTop = 0.f;
+            inputSourceWidth = p.x;
+            inputSourceHeight = p.y;
+        }
+        setViewport(viewport.left, viewport.top, viewport.width(), viewport.height(), p.x, p.y);
+
+        updateInputTransform();
+        sendWindowChange();
+    }
+
     @Override
     protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
         super.onMeasure(widthMeasureSpec, heightMeasureSpec);
-
-        Prefs prefs = MainActivity.getPrefs();
-        if (prefs.displayStretch.get()
-              || "native".equals(prefs.displayResolutionMode.get())
-              || "scaled".equals(prefs.displayResolutionMode.get())) {
-            getHolder().setSizeFromLayout();
-            return;
-        }
-
-        getDimensionsFromSettings();
-
-        if (p.x <= 0 || p.y <= 0)
-            return;
-
-        int width = getMeasuredWidth();
-        int height = getMeasuredHeight();
-
-        if (prefs.adjustResolution.get() && ((width < height && p.x > p.y) || (width > height && p.x < p.y)))
-            //noinspection SuspiciousNameCombination
-            p.set(p.y, p.x);
-
-        if (width > height * p.x / p.y)
-            width = height * p.x / p.y;
-        else
-            height = width * p.y / p.x;
-
-        getHolder().setFixedSize(p.x, p.y);
-        setMeasuredDimension(width, height);
+        updateViewport();
     }
 
     @Override
@@ -736,6 +806,8 @@ public class LorieView extends SurfaceView implements InputStub {
     ClipboardManager.OnPrimaryClipChangedListener clipboardListener = this::handleClipboardChange;
 
     public void reloadPreferences(Prefs p) {
+        String filtering = p.displayFilteringMode.get();
+        setFiltering("nearest".equals(filtering) ? GLES20.GL_NEAREST : GLES20.GL_LINEAR);
         hardwareKbdScancodesWorkaround = p.hardwareKbdScancodesWorkaround.get();
         clipboardSyncEnabled = p.clipboardEnable.get();
         setClipboardSyncEnabled(clipboardSyncEnabled, clipboardSyncEnabled);
@@ -824,14 +896,17 @@ public class LorieView extends SurfaceView implements InputStub {
         if (!commitedText)
             return;
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
-            mIMM.invalidateInput(this);
-        else
-            mIMM.restartInput(this);
+        postDelayed(() -> {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+                mIMM.invalidateInput(this);
+            else
+                mIMM.restartInput(this);
+        }, 10);
     }
 
     @FastNative private native void nativeInit();
     @FastNative private native void surfaceChanged(Surface surface);
+    @FastNative private native void setFiltering(int filtering);
     @FastNative static native void connect(int fd);
     @CriticalNative static native boolean connected();
     @FastNative static native void startLogcat(int fd);
@@ -839,6 +914,19 @@ public class LorieView extends SurfaceView implements InputStub {
     @FastNative public native void sendClipboardAnnounce();
     @FastNative public native void sendClipboardEvent(byte[] text);
     @FastNative static native void sendWindowChange(int width, int height, int framerate, String name);
+    @FastNative static native void setViewport(int x, int y, int width, int height, int expectedWidth, int expectedHeight);
+    @FastNative private static native void setRendererZoom(int percent);
+
+    public void adjustRendererZoom(int delta) {
+        rendererZoom = MathUtils.clamp(rendererZoom + delta, 100, 400);
+        setRendererZoom(rendererZoom);
+    }
+
+    public void resetRendererZoom() {
+        rendererZoom = 100;
+        setRendererZoom(rendererZoom);
+    }
+
     @FastNative public native void sendMouseEvent(float x, float y, int whichButton, boolean buttonDown, boolean relative);
     @FastNative public native void sendTouchEvent(int action, int id, int x, int y);
     @FastNative public native void sendStylusEvent(float x, float y, int pressure, int tiltX, int tiltY, int orientation, int buttons, boolean eraser, boolean mouseMode);
