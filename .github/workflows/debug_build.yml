@@ -14,9 +14,7 @@ on:
     paths-ignore:
       - '**.md'
       - 'img/**'
-runs:
-  using: 'node24'
-  main: 'main.js'
+
 permissions:
   contents: write
   
