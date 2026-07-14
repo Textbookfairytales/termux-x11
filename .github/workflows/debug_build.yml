@@ -26,6 +26,7 @@ on:
     paths-ignore:
       - '**.md'
       - 'img/**'
+workflow_dispatch:
 
 permissions:
   contents: write
